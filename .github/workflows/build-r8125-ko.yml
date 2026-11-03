@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             kmod xz-utils bzip2 wget ca-certificates patch \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dwarves
 
       - name: Cache downloads
         uses: actions/cache@v4
@@ -106,7 +106,10 @@ jobs:
             --disable PREEMPT --disable PREEMPT_VOLUNTARY --disable PREEMPT_DYNAMIC --disable PREEMPT_RT \
             --disable PREEMPT_BUILD --disable PREEMPTION \
             --enable PREEMPT_NONE \
-            --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES \
+            --enable DEBUG_INFO_BTF --enable DEBUG_INFO_BTF_MODULES \
+            --enable FTRACE --enable FUNCTION_TRACER --enable DYNAMIC_FTRACE \
+            --enable TRACEPOINTS --enable EVENT_TRACING --enable JUMP_LABEL \
+            --enable KPROBES --enable KPROBE_EVENTS \
             --disable LTO_CLANG --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL \
             --disable CFI_CLANG --disable RANDSTRUCT --disable GCC_PLUGIN_RANDSTRUCT \
             2>/dev/null || true
@@ -226,6 +229,36 @@ jobs:
             exit 2
           fi
 
+          # 关键：struct module 布局必须和固件内核一致。
+          # 固件里全部 248 个原厂模块的 .gnu.linkonce.this_module 都是 1216 字节。
+          THIS_MOD="$(python3 - "$OUT/r8125.ko" <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read()
+          shoff = struct.unpack_from('<Q', d, 0x28)[0]
+          es = struct.unpack_from('<H', d, 0x3A)[0]
+          n = struct.unpack_from('<H', d, 0x3C)[0]
+          si = struct.unpack_from('<H', d, 0x3E)[0]
+          secs = []
+          for i in range(n):
+              o = shoff + i * es
+              secs.append((struct.unpack_from('<I', d, o)[0],
+                           struct.unpack_from('<Q', d, o + 24)[0],
+                           struct.unpack_from('<Q', d, o + 32)[0]))
+          base = secs[si][1]
+          for nm, off, sz in secs:
+              name = d[base + nm:d.index(b'\0', base + nm)].decode()
+              if name == '.gnu.linkonce.this_module':
+                  print(sz)
+                  break
+          PY
+          )"
+          echo "struct module size: ${THIS_MOD}（固件原厂模块均为 1216）"
+          if [ "$THIS_MOD" != "1216" ]; then
+            echo "!! struct module 布局与固件内核不一致（MODVERSIONS 关闭时内核不会拦，加载可能崩溃/未知符号）"
+            echo "!! 禁止刷入设备；需要与固件完全相同的内核 .config 重新编译"
+            exit 3
+          fi
+
           echo "depends: $(modinfo -F depends "$OUT/r8125.ko" 2>/dev/null || echo '(未知)')"
           readelf -h "$OUT/r8125.ko" | sed -n 's/^ *Machine:.*/&/p' || true
 
@@ -248,7 +281,7 @@ jobs:
             echo "（仓库里没有 backup/r8125-9.016.01-original.ko，跳过符号比对；不影响出 .ko）"
           fi
 
-          sha256sum "$OUT/r8125.ko" | tee "$OUT/r8125.ko.sha256"
+          ( cd "$OUT" && sha256sum r8125.ko > r8125.ko.sha256 )
           echo "==> 完成: $OUT/r8125.ko"
 
       - name: Upload artifact
