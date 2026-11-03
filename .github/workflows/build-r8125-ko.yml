@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             kmod xz-utils bzip2 wget ca-certificates patch \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dwarves
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dwarves python3-pyelftools
 
       - name: Cache downloads
         uses: actions/cache@v4
@@ -96,27 +96,56 @@ jobs:
           cat "$WORK/dl/config-generic-6.18" "$WORK/dl/config-rockchip-armv8-6.18" > "$KSRC/.config"
 
           cd "$KSRC"
+          # 每一项都由固件 kernel 自带的 vmlinux BTF（struct module 63 个成员）反推：
+          #   KALLSYMS=y            -> kallsyms/core_kallsyms/sect_attrs/notes_attrs（904..960）
+          #   BPF_EVENTS=y          -> num_bpf_raw_events/bpf_raw_events（1024..1040，16 字节）
+          #   DEBUG_INFO_BTF_MODULES=y -> btf_data_size..btf_base_data（1040..1064）
+          #   JUMP_LABEL=y          -> jump_entries/num_jump_entries（1064）
+          #   TRACING=y             -> num_trace_bprintk_fmt/trace_bprintk_fmt_start（1076）
+          #   EVENT_TRACING=y       -> trace_events..num_trace_evals（1088..1120）
+          #   DYNAMIC_FTRACE=n      -> 固件没有 num_ftrace_callsites/ftrace_callsites（上一版多出的 12 字节）
+          #   KPROBES=y             -> kprobes_text_start..num_kprobe_blacklist（1120..1152）
+          #   LIVEPATCH/PRINTK_INDEX/KUNIT=n -> 固件 struct module 里没有这三块
           scripts/config --file .config \
             --set-str LOCALVERSION "" \
             --disable LOCALVERSION_AUTO \
             --enable SMP \
             --enable MODULE_UNLOAD \
+            --enable SYSFS \
+            --enable KALLSYMS \
             --disable MODVERSIONS \
-            --disable MODULE_SIG --disable MODULE_SIG_ALL \
+            --disable MODULE_SIG --disable MODULE_SIG_ALL --disable MODULE_SIG_FORCE \
             --disable PREEMPT --disable PREEMPT_VOLUNTARY --disable PREEMPT_DYNAMIC --disable PREEMPT_RT \
             --disable PREEMPT_BUILD --disable PREEMPTION \
             --enable PREEMPT_NONE \
+            --enable DEBUG_INFO --disable DEBUG_INFO_REDUCED \
             --enable DEBUG_INFO_BTF --enable DEBUG_INFO_BTF_MODULES \
-            --enable FTRACE --enable FUNCTION_TRACER --enable DYNAMIC_FTRACE \
-            --enable TRACEPOINTS --enable EVENT_TRACING --enable JUMP_LABEL \
-            --enable KPROBES --enable KPROBE_EVENTS \
+            --enable BPF_SYSCALL --enable PERF_EVENTS --enable BPF_EVENTS \
+            --enable TRACEPOINTS --enable TRACING --enable EVENT_TRACING --enable FTRACE \
+            --disable FUNCTION_TRACER --disable FUNCTION_GRAPH_TRACER --disable DYNAMIC_FTRACE \
+            --enable JUMP_LABEL --enable KPROBES --enable KPROBE_EVENTS \
+            --disable LIVEPATCH --disable PRINTK_INDEX --disable KUNIT \
+            --disable STACKTRACE_BUILD_ID \
             --disable LTO_CLANG --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL \
             --disable CFI_CLANG --disable RANDSTRUCT --disable GCC_PLUGIN_RANDSTRUCT \
             2>/dev/null || true
           make ARCH="$ARCH" CROSS_COMPILE="$CROSS" olddefconfig >/dev/null
 
+          # olddefconfig 会按依赖关系丢弃不成立的项：在这里先硬校验，避免白跑一次编译。
+          chk_on()  { grep -q "^CONFIG_$1=y" .config || { echo "!! CONFIG_$1 没生效（应为 y）"; exit 1; }; }
+          chk_off() { if grep -q "^CONFIG_$1=y" .config; then echo "!! CONFIG_$1 没关掉（应为 n）"; exit 1; fi; }
+          for c in SMP MODULE_UNLOAD SYSFS KALLSYMS DEBUG_INFO DEBUG_INFO_BTF \
+                   DEBUG_INFO_BTF_MODULES BPF_SYSCALL PERF_EVENTS BPF_EVENTS \
+                   TRACEPOINTS TRACING EVENT_TRACING JUMP_LABEL KPROBES KPROBE_EVENTS; do
+            chk_on "$c"
+          done
+          for c in DYNAMIC_FTRACE FUNCTION_TRACER FUNCTION_GRAPH_TRACER LIVEPATCH \
+                   PRINTK_INDEX KUNIT STACKTRACE_BUILD_ID MODVERSIONS MODULE_SIG; do
+            chk_off "$c"
+          done
+
           echo "--- 关键配置 ---"
-          grep -E '^CONFIG_(LOCALVERSION|SMP|MODULE_UNLOAD|MODVERSIONS|MODULE_SIG|PREEMPT)' .config | sort || true
+          grep -E '^CONFIG_(KALLSYMS|BPF_EVENTS|BPF_SYSCALL|PERF_EVENTS|DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|DYNAMIC_FTRACE|FUNCTION_TRACER|FTRACE|TRACING|EVENT_TRACING|TRACEPOINTS|JUMP_LABEL|KPROBES|KPROBE_EVENTS|LIVEPATCH|PRINTK_INDEX|KUNIT|MODULE_UNLOAD|SMP)' .config | sort || true
 
           echo "==> [4/6] modules_prepare"
           make ARCH="$ARCH" CROSS_COMPILE="$CROSS" -j"$(nproc)" modules_prepare
@@ -229,35 +258,143 @@ jobs:
             exit 2
           fi
 
-          # 关键：struct module 布局必须和固件内核一致。
-          # 固件里全部 248 个原厂模块的 .gnu.linkonce.this_module 都是 1216 字节。
-          THIS_MOD="$(python3 - "$OUT/r8125.ko" <<'PY'
+          # ABI 闸门：以固件 kernel 镜像里自带的 vmlinux BTF 为准（struct module = 63 个成员）。
+          # 固件原厂 r8125：size=1216 init=312 exit=1184；上一版产物 size 也是 1216（64 字节对齐
+          # 把差异抹平了），但 exit=1176，多出 DYNAMIC_FTRACE 的 12 字节、少了 BPF_EVENTS 的 16 字节。
+          # 所以这里不只比三个数，还把 63 个成员偏移逐项比对；任一不符 exit 3，不产 artifact。
+          echo "==> [6/6] ABI 闸门（ELF 三元组 + BTF 是否生成 + DWARF 逐字段）"
+          python3 - "$OUT/r8125.ko" <<'PY'
           import struct, sys
-          d = open(sys.argv[1], 'rb').read()
-          shoff = struct.unpack_from('<Q', d, 0x28)[0]
-          es = struct.unpack_from('<H', d, 0x3A)[0]
-          n = struct.unpack_from('<H', d, 0x3C)[0]
-          si = struct.unpack_from('<H', d, 0x3E)[0]
-          secs = []
+
+          EXP_SIZE, EXP_INIT, EXP_EXIT = 1216, 312, 1184
+          # 来自固件镜像内 vmlinux BTF 的 struct module（bit offset 已换算成字节）。
+          EXPECT = {
+              'state': 0, 'list': 8, 'name': 24, 'mkobj': 80,
+              'modinfo_attrs': 176, 'version': 184, 'srcversion': 192, 'holders_dir': 200,
+              'syms': 208, 'crcs': 216, 'num_syms': 224, 'param_lock': 232,
+              'kp': 264, 'num_kp': 272, 'num_gpl_syms': 276, 'gpl_syms': 280,
+              'gpl_crcs': 288, 'using_gplonly_symbols': 296, 'async_probe_requested': 297,
+              'num_exentries': 300, 'extable': 304, 'init': 312, 'mem': 320,
+              'arch': 824, 'taints': 864, 'num_bugs': 872, 'bug_list': 880,
+              'bug_table': 896, 'kallsyms': 904, 'core_kallsyms': 912, 'sect_attrs': 944,
+              'notes_attrs': 952, 'args': 960, 'percpu': 968, 'percpu_size': 976,
+              'noinstr_text_start': 984, 'noinstr_text_size': 992, 'num_tracepoints': 996,
+              'tracepoints_ptrs': 1000, 'num_srcu_structs': 1008, 'srcu_struct_ptrs': 1016,
+              'num_bpf_raw_events': 1024, 'bpf_raw_events': 1032,
+              'btf_data_size': 1040, 'btf_base_data_size': 1044,
+              'btf_data': 1048, 'btf_base_data': 1056,
+              'jump_entries': 1064, 'num_jump_entries': 1072,
+              'num_trace_bprintk_fmt': 1076, 'trace_bprintk_fmt_start': 1080,
+              'trace_events': 1088, 'num_trace_events': 1096,
+              'trace_evals': 1104, 'num_trace_evals': 1112,
+              'kprobes_text_start': 1120, 'kprobes_text_size': 1128,
+              'kprobe_blacklist': 1136, 'num_kprobe_blacklist': 1144,
+              'source_list': 1152, 'target_list': 1168, 'exit': 1184, 'refcnt': 1192,
+          }
+
+          def fail(msg):
+              print('!! ' + msg)
+
+          ko = sys.argv[1]
+          x = open(ko, 'rb').read()
+
+          shoff = struct.unpack_from('<Q', x, 0x28)[0]
+          es = struct.unpack_from('<H', x, 0x3A)[0]
+          n = struct.unpack_from('<H', x, 0x3C)[0]
+          si = struct.unpack_from('<H', x, 0x3E)[0]
+          raw = []
           for i in range(n):
               o = shoff + i * es
-              secs.append((struct.unpack_from('<I', d, o)[0],
-                           struct.unpack_from('<Q', d, o + 24)[0],
-                           struct.unpack_from('<Q', d, o + 32)[0]))
-          base = secs[si][1]
-          for nm, off, sz in secs:
-              name = d[base + nm:d.index(b'\0', base + nm)].decode()
-              if name == '.gnu.linkonce.this_module':
-                  print(sz)
-                  break
+              raw.append((struct.unpack_from('<I', x, o)[0],
+                          struct.unpack_from('<Q', x, o + 24)[0],
+                          struct.unpack_from('<Q', x, o + 32)[0]))
+          base = raw[si][1]
+          sec = {}
+          for no, off, sz in raw:
+              sec[x[base + no:x.index(b'\0', base + no)].decode()] = (off, sz)
+
+          tm = sec.get('.gnu.linkonce.this_module')
+          rela = sec.get('.rela.gnu.linkonce.this_module')
+          btf = sec.get('.BTF')
+          size = tm[1] if tm else 0
+          offs = []
+          if rela:
+              offs = sorted(struct.unpack_from('<Q', x, rela[0] + i * 24)[0]
+                            for i in range(rela[1] // 24))
+          init = offs[0] if offs else 0
+          exitoff = offs[1] if len(offs) > 1 else 0
+
+          print('struct module: size=%d init=%d exit=%d（期望 %d/%d/%d）'
+                % (size, init, exitoff, EXP_SIZE, EXP_INIT, EXP_EXIT))
+          # 注意：这里只要求 .config 里 BTF=y、struct module 里有 btf_data 字段；
+          # 不要求 .ko 自带 .BTF —— 只做 modules_prepare 时没有 vmlinux，pahole 会打印
+          # "Skipping BTF generation ... due to unavailability of vmlinux"，模块 .BTF 不会生成。
+          # 模块自己的 .BTF 与 ABI 无关（固件原厂模块有 .BTF，是因为它随整机 vmlinux 一起构建）。
+          print('.BTF: %s（仅供参考；缺失不影响 ABI）'
+                % ('%d 字节' % btf[1] if btf else '缺失（无 vmlinux，pahole 跳过）'))
+
+          bad = 0
+          if size != EXP_SIZE:
+              fail('size %d != %d' % (size, EXP_SIZE)); bad += 1
+          if init != EXP_INIT:
+              fail('init 偏移 %d != %d' % (init, EXP_INIT)); bad += 1
+          if exitoff != EXP_EXIT:
+              fail('exit 偏移 %d != %d' % (exitoff, EXP_EXIT)); bad += 1
+
+          try:
+              from elftools.elf.elffile import ELFFile
+          except ImportError:
+              fail('缺少 python3-pyelftools，无法做字段级比对'); bad += 1
+              print('!! ABI 闸门未通过（%d 项），禁止刷入设备' % bad)
+              sys.exit(3)
+
+          got = {}
+          try:
+              with open(ko, 'rb') as f:
+                  dw = ELFFile(f).get_dwarf_info()
+                  for cu in dw.iter_CUs():
+                      for die in cu.iter_DIEs():
+                          if die.tag != 'DW_TAG_structure_type':
+                              continue
+                          nm = die.attributes.get('DW_AT_name')
+                          bs = die.attributes.get('DW_AT_byte_size')
+                          if not nm or nm.value != b'module' or not bs or bs.value != EXP_SIZE:
+                              continue
+                          m = {}
+                          for ch in die.iter_children():
+                              if ch.tag != 'DW_TAG_member':
+                                  continue
+                              mn = ch.attributes.get('DW_AT_name')
+                              lo = ch.attributes.get('DW_AT_data_member_location')
+                              if mn and lo:
+                                  m[mn.value.decode('utf-8', 'replace')] = lo.value
+                          if len(m) > len(got):
+                              got = m
+                      if len(got) >= 60:
+                          break
+          except Exception as exc:  # DWARF 损坏/缺 .debug_info
+              fail('读 DWARF 失败：%s（DEBUG_INFO 是否生效？）' % exc); bad += 1
+
+          if not got:
+              fail('DWARF 里找不到 struct module（DEBUG_INFO 没生效或模块被 strip）'); bad += 1
+          else:
+              print('DWARF struct module: %d 个成员（期望 %d 个）' % (len(got), len(EXPECT)))
+              for k, v in EXPECT.items():
+                  if k not in got:
+                      fail('缺少成员 %-24s（期望偏移 %d）' % (k, v)); bad += 1
+                  elif got[k] != v:
+                      fail('成员偏移 %-24s 实际 %d != 期望 %d' % (k, got[k], v)); bad += 1
+              for k, v in got.items():
+                  if k not in EXPECT:
+                      fail('多出成员 %-24s（偏移 %d）' % (k, v)); bad += 1
+
+          if bad:
+              print('!! ABI 闸门未通过（%d 项）；MODVERSIONS 关闭时内核不会拦，'
+                    '偏移错会导致 rmmod 不执行 cleanup / refcnt 错位' % bad)
+              print('!! 禁止刷入设备；请按固件 vmlinux BTF 重新对齐内核配置')
+              sys.exit(3)
+          print('ABI OK：size/init/exit + %d 个成员偏移全部与固件 vmlinux BTF 一致' % len(EXPECT))
           PY
-          )"
-          echo "struct module size: ${THIS_MOD}（固件原厂模块均为 1216）"
-          if [ "$THIS_MOD" != "1216" ]; then
-            echo "!! struct module 布局与固件内核不一致（MODVERSIONS 关闭时内核不会拦，加载可能崩溃/未知符号）"
-            echo "!! 禁止刷入设备；需要与固件完全相同的内核 .config 重新编译"
-            exit 3
-          fi
 
           echo "depends: $(modinfo -F depends "$OUT/r8125.ko" 2>/dev/null || echo '(未知)')"
           readelf -h "$OUT/r8125.ko" | sed -n 's/^ *Machine:.*/&/p' || true
